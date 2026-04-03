@@ -1,21 +1,34 @@
-require('dotenv').config();
 const express = require('express');
 const https = require('https');
 const fs = require('fs');
 const socketIo = require('socket.io');
 const webpush = require('web-push');
 const cors = require('cors');
-
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static('./'));
 
-// ТВОИ КЛЮЧИ VAPID
+// 1. Отдаем манифест правильно
+app.get('/manifest.json', (req, res) => {
+    res.header('Content-Type', 'application/manifest+json');
+    res.sendFile(path.join(__dirname, 'manifest.json'));
+});
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    next();
+});
+// 2. Раздаем статику
+app.use('/icons', express.static(path.join(__dirname, 'icons')));
+app.use(express.static(path.join(__dirname, './')));
+
+// КЛЮЧИ
 const vapidKeys = {
     publicKey: 'BCZdj6WO7lK8zUeb-WusCjP3CQEFwiWgb2mZs8o_LHpPDPsfh3x_hgEOO22ACCkAZMeehfaoPeWLJ_8lJ64mRpg',
-    privateKey: process.env.VAPID_PRIVATE_KEY // берется из скрытого файла
+    privateKey: 'gVKkl4iQJJs_JnhUSuaX_TZtguZqRTMD9wcvC95YEhA'
 };
 
 webpush.setVapidDetails('mailto:test@example.com', vapidKeys.publicKey, vapidKeys.privateKey);
@@ -23,7 +36,6 @@ webpush.setVapidDetails('mailto:test@example.com', vapidKeys.publicKey, vapidKey
 let subscriptions = [];
 const reminders = new Map();
 
-// Создание HTTPS сервера
 const server = https.createServer({
     key: fs.readFileSync('localhost-key.pem'),
     cert: fs.readFileSync('localhost.pem')
@@ -32,63 +44,40 @@ const server = https.createServer({
 const io = socketIo(server);
 
 io.on('connection', (socket) => {
-    console.log('🔗 Клиент подключён:', socket.id);
-
-    socket.on('newTask', (task) => {
-        socket.broadcast.emit('taskAdded', task);
-    });
-
+    socket.on('newTask', (task) => socket.broadcast.emit('taskAdded', task));
     socket.on('newReminder', (reminder) => {
         const delay = reminder.reminderTime - Date.now();
         if (delay <= 0) return;
-
         const timeoutId = setTimeout(() => {
             const payload = JSON.stringify({ 
                 title: '⏰ ВНИМАНИЕ!', 
                 body: reminder.text, 
                 reminderId: reminder.id 
             });
-
-            // Безопасная отправка (с удалением битых подписок)
             subscriptions.forEach((sub, index) => {
-                webpush.sendNotification(sub, payload)
-                    .then(() => console.log('✅ Push отправлен успешно'))
-                    .catch(e => {
-                        if (e.statusCode === 410 || e.statusCode === 404) {
-                            console.log('🗑 Удаление просроченной подписки');
-                            subscriptions.splice(index, 1);
-                        }
-                    });
+                webpush.sendNotification(sub, payload).catch(e => {
+                    if (e.statusCode === 410) subscriptions.splice(index, 1);
+                });
             });
             reminders.delete(reminder.id);
         }, delay);
-
         reminders.set(reminder.id, { timeoutId, text: reminder.text });
     });
 });
 
-app.post('/subscribe', (req, res) => {
-    subscriptions.push(req.body);
-    res.status(201).json({ message: 'OK' });
-});
+app.post('/subscribe', (req, res) => { subscriptions.push(req.body); res.status(201).json({ message: 'OK' }); });
 
 app.post('/snooze', (req, res) => {
-    const reminderId = parseInt(req.query.reminderId, 10);
-    if (!reminders.has(reminderId)) return res.status(404).send();
-
-    const reminder = reminders.get(reminderId);
-    clearTimeout(reminder.timeoutId);
-    
-    const newTimeoutId = setTimeout(() => {
-        const payload = JSON.stringify({ title: '💤 ОТЛОЖЕНО', body: `Повтор: ${reminder.text}`, reminderId });
+    const rId = parseInt(req.query.reminderId);
+    if (!reminders.has(rId)) return res.status(404).send();
+    const rem = reminders.get(rId);
+    clearTimeout(rem.timeoutId);
+    const nId = setTimeout(() => {
+        const payload = JSON.stringify({ title: '💤 ОТЛОЖЕНО', body: `Повтор: ${rem.text}`, reminderId: rId });
         subscriptions.forEach(sub => webpush.sendNotification(sub, payload).catch(() => {}));
-        reminders.delete(reminderId);
-    }, 10000); // 10 секунд для теста
-
-    reminders.set(reminderId, { timeoutId: newTimeoutId, text: reminder.text });
+    }, 10000);
+    reminders.set(rId, { timeoutId: nId, text: rem.text });
     res.json({ message: 'OK' });
 });
 
-server.listen(3000, () => {
-    console.log('✅ СЕРВЕР: https://localhost:3000');
-});
+server.listen(3000, () => console.log('✅ HTTPS Server: https://localhost:3000'));
